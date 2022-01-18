@@ -1,6 +1,7 @@
 // Copied from: https://www.unicorn-engine.org/docs/tutorial.html
 
 #include <unicorn/unicorn.h>
+#include <cstdlib>
 
 // code to be emulated
 #define X86_CODE32 "\x41\x4a" // INC ecx; DEC edx
@@ -54,5 +55,5 @@ int main(int argc, char** argv, char** envp)
 
     uc_close(uc);
 
-    return 0;
+    return r_ecx == 0x1235 && r_edx == 0x788f ? EXIT_SUCCESS : EXIT_FAILURE;
 }

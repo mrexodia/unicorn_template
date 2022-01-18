@@ -1,11 +1,7 @@
 # WARNING: unicorn is licensed under GPLv2
 CPMAddPackage(
     NAME unicorn
-    GIT_REPOSITORY https://github.com/mrexodia/unicorn
-    GIT_TAG 42d0682c6c04bf8e5bf9e5d7d0075b82b218af55
-    OPTIONS
-        "BUILD_SHARED_LIBS OFF"
-        "UNICORN_BUILD_SAMPLES OFF"
-        "UNICORN_INSTALL OFF"
-        "UNICORN_STATIC_MSVCRT OFF"
+    VERSION 2.0.0
+    GIT_REPOSITORY https://github.com/unicorn-engine/unicorn
+    GIT_TAG e018a9ca6a7ab0b0b70139a80998bd6959e90837
 )
