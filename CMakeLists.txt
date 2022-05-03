@@ -12,6 +12,8 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 set(CMAKE_FOLDER "Dependencies")
 include(CPM)
 include(unicorn)
+include(keystone)
+include(capstone)
 
 set(CMAKE_FOLDER "")
 
@@ -21,6 +23,8 @@ add_executable(${PROJECT_NAME}
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     unicorn
+    keystone
+    capstone
 )
 
 # Set Visual Studio startup project
