@@ -27,6 +27,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     capstone
 )
 
+target_compile_features(${PROJECT_NAME} PRIVATE
+    cxx_std_17
+)
+
 # Set Visual Studio startup project
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
 
