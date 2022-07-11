@@ -292,23 +292,106 @@ static SegmentRegisters windows_user_segment = { 0x33, 0x2B, 0x2B, 0x2B, 0x53, 0
 static SegmentRegisters windows_wow64_segment = { 0x23, 0x2B, 0x2B, 0x2B, 0x53, 0x2B };
 
 static constexpr size_t kernel_stack_size = 0x5000; // JustMagic: should be 13kb
+static constexpr size_t tss_stack_size = page_size; // TODO: made up number
 static constexpr size_t kernel_code_size = page_size;
-static constexpr uint64_t emulation_end_addr = 0x1337133713371337;
+static constexpr size_t idt_code_size = page_size;
+static constexpr size_t end_code_size = page_size;
 
 static uint64_t windows_tss_base;
 static uint64_t windows_gdt_base;
+static uint64_t windows_idt_base;
 static uint64_t kernel_stack;
 static uint64_t kernel_code;
 static uint64_t kernel_teb;
+static uint64_t tss_stack;
+static uint64_t idt_code;
+static uint64_t end_code;
 
 static DumbPoolAllocator kernel_pool(0xfffff8076d963000 - 0x963000, 0x964000);
 static uint64_t kernel_range_size;
 static uint64_t kernel_range_start = kernel_pool
 .end(&windows_tss_base, page_size, "tss")
 .end(&windows_gdt_base, page_size, "gdt")
+.end(&windows_idt_base, page_size, "idt")
 .end(&kernel_stack, kernel_stack_size, "kernel stack")
+.end(&tss_stack, tss_stack_size, "tss stack")
 .start(&kernel_code, kernel_code_size, "kernel code")
+.start(&idt_code, idt_code_size, "idt code")
+.start(&end_code, end_code_size, "end code")
 .pool_start(&kernel_range_size);
+
+#pragma pack(push, 1)
+
+// Information: https://wiki.osdev.org/IDT#Structure_on_x86-64
+// Source: https://github.com/ntdiff/headers/blob/ec39df2a0d463404b8da0facdc4bebd2e838e40f/Win7_SP1/x64/System32/ndis.sys/Standalone/_KIDTENTRY64.h
+// Some interrupt names: https://gitlab.com/bztsrc/minidbg/-/blob/master/x86_64/dbgc.c#L42-44
+// Another interesting post: https://www.alex-ionescu.com/?p=340
+typedef union _KIDTENTRY64
+{
+	union
+	{
+		struct
+		{
+			/* 0x0000 */ unsigned short OffsetLow;
+			/* 0x0002 */ unsigned short Selector; // Code segment in the GDT
+			struct /* bitfield */
+			{
+				/* 0x0004 */ unsigned short IstIndex : 3; /* bit position: 0 */ // If the bits are all set to zero, the Interrupt Stack Table is not used.
+				/* 0x0004 */ unsigned short Reserved0 : 5; /* bit position: 3 */
+				/* 0x0004 */ unsigned short Type : 5; /* bit position: 8 */ // E: 64-bit interrupt gate, 0xF: 64-bit trap gate
+				/* 0x0004 */ unsigned short Dpl : 2; /* bit position: 13 */ // A 2-bit value which defines the CPU Privilege Levels which are allowed to access this interrupt via the INT instruction. Hardware interrupts ignore this mechanism.
+				/* 0x0004 */ unsigned short Present : 1; /* bit position: 15 */ // Present bit. Must be set (1) for the descriptor to be valid.
+			}; /* bitfield */
+			/* 0x0006 */ unsigned short OffsetMiddle;
+			/* 0x0008 */ unsigned long OffsetHigh;
+			/* 0x000c */ unsigned long Reserved1;
+		}; /* size: 0x0010 */
+		/* 0x0000 */ unsigned __int64 Alignment;
+	}; /* size: 0x0010 */
+} KIDTENTRY64, * PKIDTENTRY64; /* size: 0x0010 */
+static_assert(sizeof(KIDTENTRY64) == 0x10, "");
+
+/* Reference: https://wiki.osdev.org/Task_State_Segment
+0: kd> dt nt!_KTSS64 0xfffff8014af63000
+   +0x000 Reserved0        : 0
+   +0x004 Rsp0             : 0xfffff801`4af6ec90
+   +0x00c Rsp1             : 0
+   +0x014 Rsp2             : 0
+   +0x01c Ist              : [8] 0
+   +0x05c Reserved1        : 0
+   +0x064 Reserved2        : 0
+   +0x066 IoMapBase        : 0x68
+0: kd> dx -id 0,0,ffffbe8a7827f040 -r1 (*((ntkrnlmp!unsigned __int64 (*)[8])0xfffff8014af6301c))
+(*((ntkrnlmp!unsigned __int64 (*)[8])0xfffff8014af6301c))                 [Type: unsigned __int64 [8]]
+	[0]              : 0x0 [Type: unsigned __int64]
+	[1]              : 0xfffff8014af8b000 [Type: unsigned __int64]
+	[2]              : 0xfffff8014af99000 [Type: unsigned __int64]
+	[3]              : 0xfffff8014af92000 [Type: unsigned __int64]
+	[4]              : 0xfffff8014afa0000 [Type: unsigned __int64]
+	[5]              : 0x0 [Type: unsigned __int64]
+	[6]              : 0x0 [Type: unsigned __int64]
+	[7]              : 0x0 [Type: unsigned __int64]
+
+0: kd> db 0xfffff8014af63068 L20
+fffff801`4af63068  00 00 00 00 00 00 00 00-00 a0 c7 42 01 f8 ff ff  ...........B....
+fffff801`4af63078  00 00 00 00 00 00 00 00-00 00 00 00 00 00 00 00  ................
+*/
+typedef struct _KTSS64 // Size=0x68 (Id=198)
+{
+	unsigned long Reserved0;// Offset=0x0 Size=0x4
+	unsigned long long Rsp0;// Offset=0x4 Size=0x8
+	unsigned long long Rsp1;// Offset=0xc Size=0x8
+	unsigned long long Rsp2;// Offset=0x14 Size=0x8
+	unsigned long long Ist[8];// Offset=0x1c Size=0x40
+	unsigned long long Reserved1;// Offset=0x5c Size=0x8
+	unsigned short Reserved2;// Offset=0x64 Size=0x2
+	// If the I/O bit map base address is greater than or equal to the TSS segment limit, there is no I/O permission map,
+	// and all I / O instructions generate exceptions when the CPL is greater than the current IOPL.
+	unsigned short IoMapBase;// Offset=0x66 Size=0x2 -> 0x68 on Windows, likely that means it's disabled?
+} KTSS64, * PKTSS64;
+static_assert(sizeof(_KTSS64) == 0x68, "");
+
+#pragma pack(pop)
 
 struct Emulator
 {
@@ -317,7 +400,60 @@ struct Emulator
 	Emulator()
 	{
 		uc_assert(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+		uc_ctl_exits_enable(uc);
+		uc_hook intr_hook;
+		uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, s_uc_hook_intr, this, 0, -1);
+		uc_hook_add(uc, &intr_hook, UC_HOOK_MEM_INVALID, s_uc_hook_mem, this, 0, -1);
+		//uc_hook_add(uc, &intr_hook, UC_HOOK_CODE, s_uc_hook_code, this, 0, -1);
 		init_kernel();
+	}
+
+	void hook_intr(uint32_t intno)
+	{
+		// Source: https://gitlab.com/bztsrc/minidbg/-/blob/master/x86_64/dbgc.c#L42
+		char* exc[] = { "Div zero", "Debug", "NMI", "Breakpoint instruction", "Overflow", "Bound", "Invopcode", "DevUnavail",
+		"DblFault", "CoProc", "InvTSS", "SegFault", "StackFault", "GenProt", "PageFault", "Unknown", "Float", "Alignment",
+		"MachineCheck", "Double" };
+		if (intno > 31)
+			printf("Interrupt %02x: IRQ %d\n", intno, intno - 32);
+		else
+			printf("Exception %02x: %s\n", intno, intno < 20 ? exc[intno] : "Unknown");
+
+		printf("rip: 0x%llx\n", reg_rip());
+		printf("rsp: 0x%llx\n", reg_rsp());
+
+		//reg_write(UC_X86_REG_RIP, idt_code);
+	}
+
+	bool hook_mem(uc_mem_type type, uint64_t address, int size, int64_t value)
+	{
+		printf("hook_mem, type: %d, address: 0x%llx[0x%x] = 0x%llx\n", type, address, size, value);
+		printf("rip: 0x%llx\n", reg_rip());
+		printf("rsp: 0x%llx\n", reg_rsp());
+
+		//mem_map(address & ~(page_size - 1), page_size); // TODO: unmap this
+		//reg_write(UC_X86_REG_RIP, 0xfffff8076d00001bull);
+		return false;
+	}
+
+	void hook_code(uint64_t address, uint32_t size)
+	{
+		printf("code: 0x%llx[0x%x], rax: 0x%llx\n", address, size, reg_read<uint64_t>(UC_X86_REG_RAX));
+	}
+
+	static void s_uc_hook_intr(uc_engine* uc, uint32_t intno, void* user_data)
+	{
+		return ((Emulator*)user_data)->hook_intr(intno);
+	}
+
+	static bool s_uc_hook_mem(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data)
+	{
+		return ((Emulator*)user_data)->hook_mem(type, address, size, value);
+	}
+
+	static void s_uc_hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data)
+	{
+		return ((Emulator*)user_data)->hook_code(address, size);
 	}
 
 	~Emulator()
@@ -343,15 +479,59 @@ struct Emulator
 			switch_segment(windows_kernel_segment);
 		}
 
-		// IDT (TODO)
+		// TSS
+		{
+			KTSS64 tss = { 0 };
+			tss.Rsp0 = tss_stack + tss_stack_size - 0x100;
+			// TODO: tss.Ist
+			tss.IoMapBase = 0x68;
+			mem_write(windows_tss_base, &tss, sizeof(tss));
+		}
+
+		// IDT
+		{
+			// TODO: this is just a hack for testing a single interrupt handler
+			uint64_t handler = idt_code;
+			KIDTENTRY64 entry = { 0 };
+			entry.OffsetLow = handler & 0xFFFF;
+			entry.OffsetMiddle = (handler >> 16) & 0xFFFF;
+			entry.OffsetHigh = (handler >> 32) & 0xFFFFFFFF;
+			entry.Selector = windows_kernel_segment.cs;
+			entry.IstIndex = 0;
+			entry.Type = 0xE;
+			entry.Dpl = 0;
+			entry.Present = 1;
+			mem_write(windows_idt_base, &entry, sizeof(entry));
+			uc_x86_mmr idtr = { 0, windows_idt_base, 0xFFFF, 0 };
+			uc_assert(uc_reg_write(uc, UC_X86_REG_IDTR, &idtr));
+
+			// Create a single interrupt handler
+			{
+				auto handler = assemble(idt_code, R"ASM(
+iretq
+)ASM");
+				mem_write(idt_code, handler.data(), handler.size());
+				mem_protect(idt_code, idt_code_size, UC_PROT_READ | UC_PROT_EXEC);
+			}
+		}
 
 		// Page for shellcode
 		mem_protect(kernel_code, page_size, UC_PROT_READ | UC_PROT_EXEC);
 
+		// Page for end code
+		mem_protect(end_code, end_code_size, UC_PROT_READ | UC_PROT_EXEC);
+		std::vector<uint8_t> die(end_code_size, 0x90);
+
+		mem_write(end_code, die.data(), die.size());
+
 		// Kernel stack
-		mem_protect(kernel_stack, page_size, UC_PROT_NONE);
-		reg_write(UC_X86_REG_RSP, kernel_stack + kernel_stack_size - 0x100);
-		push(emulation_end_addr);
+		{
+			mem_protect(kernel_stack, page_size, UC_PROT_NONE);
+			auto rsp = kernel_stack + kernel_stack_size - 0x100;
+			reg_write(UC_X86_REG_RSP, rsp);
+			push(end_code);
+			printf("initial rsp: 0x%llx\n", reg_rsp());
+		}
 	}
 
 	void mem_map(uint64_t address, size_t size, uint32_t prot = UC_PROT_ALL)
@@ -424,16 +604,45 @@ struct Emulator
 		return value;
 	}
 
-	void start(uint64_t start, uint64_t end = emulation_end_addr)
+	uint64_t reg_rip()
 	{
-		uc_assert(uc_emu_start(uc, start, end, -1, -1));
+		return reg_read<uint64_t>(UC_X86_REG_RIP);
+	}
+
+	uint64_t reg_rsp()
+	{
+		return reg_read<uint64_t>(UC_X86_REG_RSP);
+	}
+
+	void start(uint64_t start, uint64_t end = end_code)
+	{
+		uc_ctl_set_exits(uc, &end, 1);
+		auto err = uc_emu_start(uc, start, 0, -1, -1);
+		if (err != UC_ERR_OK)
+		{
+			puts("");
+			printf("rip: 0x%llx, rsp: 0x%llx\n", reg_rip(), reg_rsp());
+			throw std::runtime_error(std::string("uc_emu_start error: ") + uc_strerror(err));
+		}
 	}
 };
 
 static void emulate(uint64_t address, const std::vector<uint8_t>& code)
 {
 	Emulator emu;
+	constexpr uint64_t scratchsize = 0x1000;
+	uint64_t scratchbase = 0;
+	kernel_pool.start(&scratchbase, scratchsize, "scratch");
+	printf("scratchbase: 0x%llx\n", scratchbase);
+	emu.mem_protect(scratchbase, scratchsize);
+	uint64_t nextaddr = scratchbase + 8;
+	emu.mem_write(scratchbase + 0x68, &nextaddr, sizeof(nextaddr));
+	emu.reg_write(UC_X86_REG_RDI, scratchbase);
 	emu.mem_write(address, code.data(), code.size());
+	auto rsp = emu.reg_rsp();
+	uint64_t ret;
+	emu.mem_read(rsp, &ret, sizeof(ret));
+	printf("ret: 0x%llx\n", ret);
 	emu.start(address);
 }
 
@@ -458,14 +667,20 @@ int main(int argc, char** argv, char** envp)
 	assert(kernel_pool.find_info(kernel_pool.pool_start() + 0x7000) == nullptr);
 
 	uint64_t address = kernel_code;
+	std::vector<uint8_t> code = {
+0x84, 0xC0, 0x75, 0x35, 0x48, 0x8B, 0xCF, 0x4C, 0x8D, 0x41, 0x60, 0x48, 0x83, 0xC3, 0x10, 0x49,
+0x8B, 0x00, 0x4C, 0x8B, 0x48, 0x08, 0x4D, 0x3B, 0xC8, 0x0F, 0x85, 0x67, 0xC0, 0x09, 0x00, 0x48,
+0x89, 0x03, 0x4C, 0x89, 0x43, 0x08, 0x48, 0x89, 0x58, 0x08, 0x49, 0x89, 0x18, 0x48, 0x8B, 0x5C,
+0x24, 0x40, 0x48, 0x83, 0xC4, 0x30, 0x5F, 0xC3, 0xCC, 0x48, 0xC1, 0xE0, 0x10, 0x48, 0x81, 0xE1,
+0x00, 0x00, 0xFF, 0xFF, 0x48, 0x2B, 0xC8, 0x48, 0x81, 0xC1, 0x00, 0x00, 0x01, 0x00, 0xEB, 0xB7
+	};
 	auto code = assemble(address, R"ASM(
-mov rax, 0x10
-mov rbx, rax
-loop:
-inc rbx
-dec rax
-jnz loop
-xor rax, 0x1337
+mov rcx,rdi
+lea r8,qword ptr ds:[rcx+0x60]
+add rbx,10
+mov rax,qword ptr ds:[r8]
+mov r9,qword ptr ds:[rax+8]
+cmp r9,r8
 ret
 )ASM");
 	printf("code: %s\n", to_hex(code).c_str());
