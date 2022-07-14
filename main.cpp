@@ -86,6 +86,20 @@ static std::string disassemble(uint64_t address, std::vector<uint8_t> code)
 	return result;
 }
 
+static std::string to_hex(const std::vector<uint8_t>& data)
+{
+	std::string result;
+	for (auto ch : data)
+	{
+		if (!result.empty())
+			result += ' ';
+		char blah[32] = "";
+		sprintf_s(blah, "%02X", ch);
+		result += blah;
+	}
+	return result;
+}
+
 #define uc_assert(x) \
 { \
 	auto err = (x); \
@@ -296,6 +310,9 @@ static constexpr size_t tss_stack_size = page_size; // TODO: made up number
 static constexpr size_t kernel_code_size = page_size;
 static constexpr size_t idt_code_size = page_size;
 static constexpr size_t end_code_size = page_size;
+static constexpr size_t ret_offset = 0x80;
+static constexpr size_t iretq_offset = 0x100;
+static constexpr size_t iretd_offset = 0x101;
 
 static uint64_t windows_tss_base;
 static uint64_t windows_gdt_base;
@@ -404,7 +421,7 @@ struct Emulator
 		uc_hook intr_hook;
 		uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, s_uc_hook_intr, this, 0, -1);
 		uc_hook_add(uc, &intr_hook, UC_HOOK_MEM_INVALID, s_uc_hook_mem, this, 0, -1);
-		//uc_hook_add(uc, &intr_hook, UC_HOOK_CODE, s_uc_hook_code, this, 0, -1);
+		uc_hook_add(uc, &intr_hook, UC_HOOK_CODE, s_uc_hook_code, this, 0, -1);
 		init_kernel();
 	}
 
@@ -430,6 +447,8 @@ struct Emulator
 		printf("hook_mem, type: %d, address: 0x%llx[0x%x] = 0x%llx\n", type, address, size, value);
 		printf("rip: 0x%llx\n", reg_rip());
 		printf("rsp: 0x%llx\n", reg_rsp());
+		printf("cs: 0x%04x\n", reg_read<uint16_t>(UC_X86_REG_CS));
+		printf("ss: 0x%04x\n", reg_read<uint16_t>(UC_X86_REG_SS));
 
 		//mem_map(address & ~(page_size - 1), page_size); // TODO: unmap this
 		//reg_write(UC_X86_REG_RIP, 0xfffff8076d00001bull);
@@ -438,7 +457,15 @@ struct Emulator
 
 	void hook_code(uint64_t address, uint32_t size)
 	{
-		printf("code: 0x%llx[0x%x], rax: 0x%llx\n", address, size, reg_read<uint64_t>(UC_X86_REG_RAX));
+		std::vector<uint8_t> code(size);
+		mem_read(address, code.data(), code.size());
+		printf("code: 0x%llx[0x%x] = %s, rsp: 0x%llx, cs: %x\n",
+			address,
+			size,
+			to_hex(code).c_str(),
+			reg_read<uint64_t>(UC_X86_REG_RSP),
+			reg_read<uint16_t>(UC_X86_REG_CS)
+		);
 	}
 
 	static void s_uc_hook_intr(uc_engine* uc, uint32_t intno, void* user_data)
@@ -521,6 +548,10 @@ iretq
 		// Page for end code
 		mem_protect(end_code, end_code_size, UC_PROT_READ | UC_PROT_EXEC);
 		std::vector<uint8_t> die(end_code_size, 0x90);
+
+		die[ret_offset] = 0xC3; // ret
+		die[iretq_offset] = 0x48; // rex.w
+		die[iretd_offset] = 0xCF; // iret
 
 		mem_write(end_code, die.data(), die.size());
 
@@ -630,6 +661,33 @@ iretq
 static void emulate(uint64_t address, const std::vector<uint8_t>& code)
 {
 	Emulator emu;
+
+	// Map wow64 code page
+	auto wow64_code_address = 0x401000;
+	std::vector<uint8_t> wow64_code(page_size, 0x90);
+	wow64_code[1] = 0x48; // rex prefix in long mode, dec eax in compatibility mode
+	wow64_code[ret_offset] = 0xC3;
+	emu.mem_map(wow64_code_address, wow64_code.size(), UC_PROT_READ | UC_PROT_EXEC);
+	emu.mem_write(wow64_code_address, wow64_code.data(), wow64_code.size());
+
+	// Map wow64 stack page
+	auto wow64_stack = 0x14F560;
+	emu.mem_map(wow64_stack & ~0xFFFull, page_size, UC_PROT_READ | UC_PROT_WRITE);
+	uint64_t testptr = wow64_code_address | 0x1234567800000000ull; // in theory the 0x12345678 is ignored
+	emu.mem_write(wow64_stack, &testptr, sizeof(testptr));
+
+	// Switch segment by executing iretq
+	emu.push(windows_wow64_segment.ss); // SS
+	emu.push(wow64_stack); // RSP
+	emu.push(emu.reg_read<uint32_t>(UC_X86_REG_EFLAGS)); // EFLAGS
+	emu.push(windows_wow64_segment.cs); // CS
+	emu.push(wow64_code_address + ret_offset); // RIP
+	emu.start(end_code + iretq_offset, wow64_code_address + 3);
+
+	printf("rax: %016llx\n", emu.reg_read<uint64_t>(UC_X86_REG_RAX));
+
+	return;
+
 	constexpr uint64_t scratchsize = 0x1000;
 	uint64_t scratchbase = 0;
 	kernel_pool.start(&scratchbase, scratchsize, "scratch");
@@ -637,27 +695,14 @@ static void emulate(uint64_t address, const std::vector<uint8_t>& code)
 	emu.mem_protect(scratchbase, scratchsize);
 	uint64_t nextaddr = scratchbase + 8;
 	emu.mem_write(scratchbase + 0x68, &nextaddr, sizeof(nextaddr));
-	emu.reg_write(UC_X86_REG_RDI, scratchbase);
+	emu.reg_write(UC_X86_REG_RCX, scratchbase);
+	emu.reg_write(UC_X86_REG_RAX, 1ull);
 	emu.mem_write(address, code.data(), code.size());
 	auto rsp = emu.reg_rsp();
 	uint64_t ret;
 	emu.mem_read(rsp, &ret, sizeof(ret));
 	printf("ret: 0x%llx\n", ret);
 	emu.start(address);
-}
-
-static std::string to_hex(const std::vector<uint8_t>& data)
-{
-	std::string result;
-	for (auto ch : data)
-	{
-		if (!result.empty())
-			result += ' ';
-		char blah[32] = "";
-		sprintf_s(blah, "%02X", ch);
-		result += blah;
-	}
-	return result;
 }
 
 int main(int argc, char** argv, char** envp)
@@ -674,19 +719,40 @@ int main(int argc, char** argv, char** envp)
 0x24, 0x40, 0x48, 0x83, 0xC4, 0x30, 0x5F, 0xC3, 0xCC, 0x48, 0xC1, 0xE0, 0x10, 0x48, 0x81, 0xE1,
 0x00, 0x00, 0xFF, 0xFF, 0x48, 0x2B, 0xC8, 0x48, 0x81, 0xC1, 0x00, 0x00, 0x01, 0x00, 0xEB, 0xB7
 	};
-	auto code = assemble(address, R"ASM(
+	code = { 0x48, 0x8B, 0xC3, 0xC3 };
+	printf("code: %s\n", to_hex(code).c_str());
+	printf("disassembled:\n%s\n", disassemble(address, code).c_str());
+	try
+	{
+#if 0
+		auto code = assemble(address, R"(
+test al,al
+jne fixme
 mov rcx,rdi
+back:
 lea r8,qword ptr ds:[rcx+0x60]
 add rbx,10
 mov rax,qword ptr ds:[r8]
 mov r9,qword ptr ds:[rax+8]
 cmp r9,r8
-ret
-)ASM");
-	printf("code: %s\n", to_hex(code).c_str());
-	printf("disassembled:\n%s\n", disassemble(address, code).c_str());
-	try
-	{
+jne ntdll.7FF84133AB61
+mov qword ptr ds:[rbx],rax
+mov qword ptr ds:[rbx+8],r8
+mov qword ptr ds:[rax+8],rbx
+mov qword ptr ds:[r8],rbx
+mov rbx,qword ptr ss:[rsp+40]
+add rsp,30
+pop rdi
+ret 
+int3
+fixme:
+shl rax,10
+and rcx,0xFFFFFFFFFFFF0000
+sub rcx,rax
+add rcx,0x10000
+jmp back
+)");
+#endif
 		emulate(address, code);
 	}
 	catch (const std::exception& x)
