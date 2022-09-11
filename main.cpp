@@ -457,12 +457,24 @@ struct Emulator
 
 	void hook_code(uint64_t address, uint32_t size)
 	{
+		// TODO: no idea why this is happening
+		if (size > 15)
+			size = 15;
+		std::string code_str;
 		std::vector<uint8_t> code(size);
-		mem_read(address, code.data(), code.size());
+		try
+		{
+			mem_read(address, code.data(), code.size());
+			code_str = to_hex(code);
+		}
+		catch (std::runtime_error& x)
+		{
+			code_str = x.what();
+		}
 		printf("code: 0x%llx[0x%x] = %s, rsp: 0x%llx, cs: %x\n",
 			address,
 			size,
-			to_hex(code).c_str(),
+			code_str.c_str(),
 			reg_read<uint64_t>(UC_X86_REG_RSP),
 			reg_read<uint16_t>(UC_X86_REG_CS)
 		);
@@ -682,7 +694,10 @@ static void emulate(uint64_t address, const std::vector<uint8_t>& code)
 	emu.push(emu.reg_read<uint32_t>(UC_X86_REG_EFLAGS)); // EFLAGS
 	emu.push(windows_wow64_segment.cs); // CS
 	emu.push(wow64_code_address + ret_offset); // RIP
-	emu.start(end_code + iretq_offset, wow64_code_address + 3);
+	emu.start(end_code + iretq_offset, wow64_code_address + ret_offset);
+	
+	// From here things are executing in compatibility mode
+	emu.start(wow64_code_address, wow64_code_address + 3);
 
 	printf("rax: %016llx\n", emu.reg_read<uint64_t>(UC_X86_REG_RAX));
 
@@ -720,10 +735,14 @@ int main(int argc, char** argv, char** envp)
 0x00, 0x00, 0xFF, 0xFF, 0x48, 0x2B, 0xC8, 0x48, 0x81, 0xC1, 0x00, 0x00, 0x01, 0x00, 0xEB, 0xB7
 	};
 	code = { 0x48, 0x8B, 0xC3, 0xC3 };
+	code = { 0xc5, 0xfe, 0x6f, 0x09 };
 	printf("code: %s\n", to_hex(code).c_str());
 	printf("disassembled:\n%s\n", disassemble(address, code).c_str());
 	try
 	{
+		Emulator emu;
+		emu.mem_write(address, code.data(), code.size());
+		emu.start(address, address + code.size());
 #if 0
 		auto code = assemble(address, R"(
 test al,al
