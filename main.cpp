@@ -422,6 +422,7 @@ struct Emulator
 		uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, s_uc_hook_intr, this, 0, -1);
 		uc_hook_add(uc, &intr_hook, UC_HOOK_MEM_INVALID, s_uc_hook_mem, this, 0, -1);
 		uc_hook_add(uc, &intr_hook, UC_HOOK_CODE, s_uc_hook_code, this, 0, -1);
+		uc_hook_add(uc, &intr_hook, UC_HOOK_INSN_INVALID, s_uc_hook_invalid, this, 0, -1);
 		init_kernel();
 	}
 
@@ -493,6 +494,11 @@ struct Emulator
 	static void s_uc_hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data)
 	{
 		return ((Emulator*)user_data)->hook_code(address, size);
+	}
+
+	static bool	s_uc_hook_invalid(uc_engine* uc, void* user_data)
+	{
+		return false;
 	}
 
 	~Emulator()
@@ -736,11 +742,13 @@ int main(int argc, char** argv, char** envp)
 	};
 	code = { 0x48, 0x8B, 0xC3, 0xC3 };
 	code = { 0xc5, 0xfe, 0x6f, 0x09 };
+	code = { 0x90 };
 	printf("code: %s\n", to_hex(code).c_str());
 	printf("disassembled:\n%s\n", disassemble(address, code).c_str());
 	try
 	{
 		Emulator emu;
+		system("pause");
 		emu.mem_write(address, code.data(), code.size());
 		emu.start(address, address + code.size());
 #if 0
