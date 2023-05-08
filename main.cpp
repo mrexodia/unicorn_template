@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <map>
 #include <stdexcept>
@@ -67,7 +68,7 @@ static std::string disassemble(uint64_t address, std::vector<uint8_t> code)
 
 		// Print address
 		char address_text[32] = "";
-		sprintf_s(address_text, "0x%llx ", address - insn->size);
+		sprintf(address_text, "0x%llx ", address - insn->size);
 		result += address_text;
 
 		// Print instruction
@@ -94,7 +95,7 @@ static std::string to_hex(const std::vector<uint8_t>& data)
 		if (!result.empty())
 			result += ' ';
 		char blah[32] = "";
-		sprintf_s(blah, "%02X", ch);
+		sprintf(blah, "%02X", ch);
 		result += blah;
 	}
 	return result;
@@ -337,79 +338,6 @@ static uint64_t kernel_range_start = kernel_pool
 .start(&end_code, end_code_size, "end code")
 .pool_start(&kernel_range_size);
 
-#pragma pack(push, 1)
-
-// Information: https://wiki.osdev.org/IDT#Structure_on_x86-64
-// Source: https://github.com/ntdiff/headers/blob/ec39df2a0d463404b8da0facdc4bebd2e838e40f/Win7_SP1/x64/System32/ndis.sys/Standalone/_KIDTENTRY64.h
-// Some interrupt names: https://gitlab.com/bztsrc/minidbg/-/blob/master/x86_64/dbgc.c#L42-44
-// Another interesting post: https://www.alex-ionescu.com/?p=340
-typedef union _KIDTENTRY64
-{
-	union
-	{
-		struct
-		{
-			/* 0x0000 */ unsigned short OffsetLow;
-			/* 0x0002 */ unsigned short Selector; // Code segment in the GDT
-			struct /* bitfield */
-			{
-				/* 0x0004 */ unsigned short IstIndex : 3; /* bit position: 0 */ // If the bits are all set to zero, the Interrupt Stack Table is not used.
-				/* 0x0004 */ unsigned short Reserved0 : 5; /* bit position: 3 */
-				/* 0x0004 */ unsigned short Type : 5; /* bit position: 8 */ // E: 64-bit interrupt gate, 0xF: 64-bit trap gate
-				/* 0x0004 */ unsigned short Dpl : 2; /* bit position: 13 */ // A 2-bit value which defines the CPU Privilege Levels which are allowed to access this interrupt via the INT instruction. Hardware interrupts ignore this mechanism.
-				/* 0x0004 */ unsigned short Present : 1; /* bit position: 15 */ // Present bit. Must be set (1) for the descriptor to be valid.
-			}; /* bitfield */
-			/* 0x0006 */ unsigned short OffsetMiddle;
-			/* 0x0008 */ unsigned long OffsetHigh;
-			/* 0x000c */ unsigned long Reserved1;
-		}; /* size: 0x0010 */
-		/* 0x0000 */ unsigned __int64 Alignment;
-	}; /* size: 0x0010 */
-} KIDTENTRY64, * PKIDTENTRY64; /* size: 0x0010 */
-static_assert(sizeof(KIDTENTRY64) == 0x10, "");
-
-/* Reference: https://wiki.osdev.org/Task_State_Segment
-0: kd> dt nt!_KTSS64 0xfffff8014af63000
-   +0x000 Reserved0        : 0
-   +0x004 Rsp0             : 0xfffff801`4af6ec90
-   +0x00c Rsp1             : 0
-   +0x014 Rsp2             : 0
-   +0x01c Ist              : [8] 0
-   +0x05c Reserved1        : 0
-   +0x064 Reserved2        : 0
-   +0x066 IoMapBase        : 0x68
-0: kd> dx -id 0,0,ffffbe8a7827f040 -r1 (*((ntkrnlmp!unsigned __int64 (*)[8])0xfffff8014af6301c))
-(*((ntkrnlmp!unsigned __int64 (*)[8])0xfffff8014af6301c))                 [Type: unsigned __int64 [8]]
-	[0]              : 0x0 [Type: unsigned __int64]
-	[1]              : 0xfffff8014af8b000 [Type: unsigned __int64]
-	[2]              : 0xfffff8014af99000 [Type: unsigned __int64]
-	[3]              : 0xfffff8014af92000 [Type: unsigned __int64]
-	[4]              : 0xfffff8014afa0000 [Type: unsigned __int64]
-	[5]              : 0x0 [Type: unsigned __int64]
-	[6]              : 0x0 [Type: unsigned __int64]
-	[7]              : 0x0 [Type: unsigned __int64]
-
-0: kd> db 0xfffff8014af63068 L20
-fffff801`4af63068  00 00 00 00 00 00 00 00-00 a0 c7 42 01 f8 ff ff  ...........B....
-fffff801`4af63078  00 00 00 00 00 00 00 00-00 00 00 00 00 00 00 00  ................
-*/
-typedef struct _KTSS64 // Size=0x68 (Id=198)
-{
-	unsigned long Reserved0;// Offset=0x0 Size=0x4
-	unsigned long long Rsp0;// Offset=0x4 Size=0x8
-	unsigned long long Rsp1;// Offset=0xc Size=0x8
-	unsigned long long Rsp2;// Offset=0x14 Size=0x8
-	unsigned long long Ist[8];// Offset=0x1c Size=0x40
-	unsigned long long Reserved1;// Offset=0x5c Size=0x8
-	unsigned short Reserved2;// Offset=0x64 Size=0x2
-	// If the I/O bit map base address is greater than or equal to the TSS segment limit, there is no I/O permission map,
-	// and all I / O instructions generate exceptions when the CPL is greater than the current IOPL.
-	unsigned short IoMapBase;// Offset=0x66 Size=0x2 -> 0x68 on Windows, likely that means it's disabled?
-} KTSS64, * PKTSS64;
-static_assert(sizeof(_KTSS64) == 0x68, "");
-
-#pragma pack(pop)
-
 struct Emulator
 {
 	uc_engine* uc = nullptr;
@@ -419,17 +347,17 @@ struct Emulator
 		uc_assert(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
 		uc_ctl_exits_enable(uc);
 		uc_hook intr_hook;
-		uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, s_uc_hook_intr, this, 0, -1);
-		uc_hook_add(uc, &intr_hook, UC_HOOK_MEM_INVALID, s_uc_hook_mem, this, 0, -1);
-		uc_hook_add(uc, &intr_hook, UC_HOOK_CODE, s_uc_hook_code, this, 0, -1);
-		uc_hook_add(uc, &intr_hook, UC_HOOK_INSN_INVALID, s_uc_hook_invalid, this, 0, -1);
+		uc_hook_add(uc, &intr_hook, UC_HOOK_INTR, (void*)&s_uc_hook_intr, this, 0, -1);
+		uc_hook_add(uc, &intr_hook, UC_HOOK_MEM_INVALID, (void*)&s_uc_hook_mem, this, 0, -1);
+		uc_hook_add(uc, &intr_hook, UC_HOOK_CODE, (void*)&s_uc_hook_code, this, 0, -1);
+		uc_hook_add(uc, &intr_hook, UC_HOOK_INSN_INVALID, (void*)&s_uc_hook_invalid, this, 0, -1);
 		init_kernel();
 	}
 
 	void hook_intr(uint32_t intno)
 	{
 		// Source: https://gitlab.com/bztsrc/minidbg/-/blob/master/x86_64/dbgc.c#L42
-		char* exc[] = { "Div zero", "Debug", "NMI", "Breakpoint instruction", "Overflow", "Bound", "Invopcode", "DevUnavail",
+		const char* exc[] = { "Div zero", "Debug", "NMI", "Breakpoint instruction", "Overflow", "Bound", "Invopcode", "DevUnavail",
 		"DblFault", "CoProc", "InvTSS", "SegFault", "StackFault", "GenProt", "PageFault", "Unknown", "Float", "Alignment",
 		"MachineCheck", "Double" };
 		if (intno > 31)
@@ -522,42 +450,6 @@ struct Emulator
 			uc_x86_mmr gdtr = { 0, windows_gdt_base, gdt_size - 1, 0 };
 			uc_assert(uc_reg_write(uc, UC_X86_REG_GDTR, &gdtr));
 			switch_segment(windows_kernel_segment);
-		}
-
-		// TSS
-		{
-			KTSS64 tss = { 0 };
-			tss.Rsp0 = tss_stack + tss_stack_size - 0x100;
-			// TODO: tss.Ist
-			tss.IoMapBase = 0x68;
-			mem_write(windows_tss_base, &tss, sizeof(tss));
-		}
-
-		// IDT
-		{
-			// TODO: this is just a hack for testing a single interrupt handler
-			uint64_t handler = idt_code;
-			KIDTENTRY64 entry = { 0 };
-			entry.OffsetLow = handler & 0xFFFF;
-			entry.OffsetMiddle = (handler >> 16) & 0xFFFF;
-			entry.OffsetHigh = (handler >> 32) & 0xFFFFFFFF;
-			entry.Selector = windows_kernel_segment.cs;
-			entry.IstIndex = 0;
-			entry.Type = 0xE;
-			entry.Dpl = 0;
-			entry.Present = 1;
-			mem_write(windows_idt_base, &entry, sizeof(entry));
-			uc_x86_mmr idtr = { 0, windows_idt_base, 0xFFFF, 0 };
-			uc_assert(uc_reg_write(uc, UC_X86_REG_IDTR, &idtr));
-
-			// Create a single interrupt handler
-			{
-				auto handler = assemble(idt_code, R"ASM(
-iretq
-)ASM");
-				mem_write(idt_code, handler.data(), handler.size());
-				mem_protect(idt_code, idt_code_size, UC_PROT_READ | UC_PROT_EXEC);
-			}
 		}
 
 		// Page for shellcode
